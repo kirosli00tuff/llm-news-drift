@@ -1,0 +1,865 @@
+# =============================================================================
+# Market AI Lab — Default Configuration (SAFE DEFAULTS)
+# =============================================================================
+# Conservative starting values for the initial phase. Every value is exposed in
+# config + UI. Live trading is DISABLED BY DEFAULT and gated behind an explicit
+# in-app approval workflow. The static safety layer (Layer 1) treats the
+# `risk:` block as HARD limits that adaptive logic may NEVER weaken.
+# =============================================================================
+
+system:
+  starting_paper_balance: 100000
+  default_mode_per_venue: paper          # disabled | recommendation_only | paper | live
+  live_mode_default_enabled: false       # live is OFF by default, everywhere
+  kill_switch_enabled: true
+  manual_resume_required_after_kill_switch: true
+  control_dir: .control                  # dir for operator control files (the GUI
+                                         # kill-request file the engine consumes);
+                                         # env MAL_CONTROL_DIR overrides at runtime
+
+# -----------------------------------------------------------------------------
+# Engine — continuous (24/7) run-forever loop. Used with `--continuous`.
+# The finite `--iterations` path (the offline demo) ignores these.
+# -----------------------------------------------------------------------------
+engine:
+  loop_interval_seconds: 15              # wall-clock seconds between ticks
+  respect_market_hours: true            # skip equity ticks when US RTH is closed
+                                        # (crypto + prediction markets stay 24/7)
+  equities_market_hours_only: true      # council cost cut: US equities (SPY, QQQ)
+                                        # skip the base-check gate + council outside
+                                        # regular US trading hours; crypto stays
+                                        # 24/7. Skips logged as `market_hours`.
+  native_conviction_feeds_gate: true    # true keeps current behavior: the native
+                                        # rule_based conviction feeds the gate
+                                        # confidence and edge. false makes gate
+                                        # confidence and edge come from advisory
+                                        # factors alone, native still drives
+                                        # direction and sizing. Composition only,
+                                        # never changes a Level-1 risk limit.
+
+# -----------------------------------------------------------------------------
+# Market data — where price snapshots come from.
+#   mock   = deterministic offline feed (no keys, default)
+#   alpaca = real-time Alpaca market-data API (paper/data key; works in Canada)
+# If 'alpaca' is selected but no key is resolvable / the fetch fails, the engine
+# automatically falls back to the mock feed and logs a clear notice.
+# -----------------------------------------------------------------------------
+market_data:
+  source: mock                          # mock | alpaca
+  data_staleness_seconds: 60            # Level-1: reject price snapshots older than this
+
+# -----------------------------------------------------------------------------
+# Venues — each supports: disabled | recommendation_only | paper | live
+# Live defaults to disabled. Paper/recommendation_only only, out of the box.
+# -----------------------------------------------------------------------------
+venues:
+  # Alpaca handles all paper trading and paper market data. It has NO live path
+  # and must never be wired to one. It is the primary online loop (feed_mode
+  # alpaca_paper).
+  alpaca:
+    mode: paper                            # primary continuous testing/training venue
+    live_enabled: false                    # Alpaca has no live path; stays false
+    paper_adapter: alpaca_paper            # Alpaca paper API (stocks + crypto)
+    live_adapter: none                     # NO live path for Alpaca, ever
+    institutional_context: sec_api_13f     # delayed disclosure context, NOT live flow
+    paper_execution: auto                  # api | sim_live_price | auto
+                                           # auto: use Alpaca paper API, else
+                                           # fall back to a simulated fill at the
+                                           # live market price (e.g. if Alpaca
+                                           # paper is geo-blocked / unreachable).
+  coinbase:                                # replaces Binance (not available in Canada)
+    mode: paper                            # simulated/paper only
+    live_enabled: false
+    paper_adapter: coinbase_sim
+    live_adapter: coinbase_live            # reserved; live adapter not implemented
+    whale_source: whale_alert_api
+  # IBKR handles live trading only. It routes through the gated Live branch and
+  # stays disabled behind the approval gate. See the ibkr block below for the IB
+  # Gateway connection settings.
+  ibkr:
+    mode: recommendation_only              # no orders placed; live stays gated off
+    live_enabled: false                    # gated off; operator flips live, not this app
+    live_adapter: ibkr_live                # live-only venue
+    institutional_context: sec_api_13f
+
+# -----------------------------------------------------------------------------
+# Layer 1 — STATIC SAFETY (HARD LIMITS). Adaptive logic may NOT weaken these.
+# -----------------------------------------------------------------------------
+risk:
+  max_daily_loss_total_pct: 0.03
+  max_daily_loss_per_venue_pct: 0.02
+  max_trade_risk_pct_of_equity: 0.005
+  max_total_open_risk_pct: 0.03
+  max_open_positions_total: 5
+  max_open_positions_per_venue: 2
+  max_exposure_per_symbol_pct: 0.02
+  max_exposure_per_market_pct: 0.02
+  max_exposure_per_category_pct: 0.05
+  max_consecutive_losses: 3
+  cooldown_minutes_after_loss_breach: 240   # Level-1 (longer/tighter than prior 120)
+  min_confidence_default: 0.65              # gate threshold; council has its own (see council:)
+  min_edge_default: 0.02
+  required_model_agreement_count: 2
+  stale_signal_reject_minutes: 1            # Level-1 (~60s; tighter than prior 10)
+  max_trades_per_day: 10                    # Level-1 ceiling, enforced in the run loop
+  max_trade_notional_cap_pct: 0.05          # Level-1 notional ceiling; the 0.005 per-trade
+                                            # risk cap above stays the binding, tighter limit
+  kill_switch_enabled: true
+  hard_stop_live_if_loss_breach: true
+  manual_resume_required_after_kill_switch: true
+
+# -----------------------------------------------------------------------------
+# Sizing — fixed-fractional default
+# -----------------------------------------------------------------------------
+# NOTE (2026-07-18): dnn_position_scale_cap and whale_position_scale_cap were
+# REMOVED. They were parsed and range-validated but no consumer ever enforced
+# them, so they claimed a safety property the code did not provide. What
+# actually bounds the advisory layers: their ensemble weights (model_weights,
+# whale_signal_weight 0.10 shipped), the discovery advisory adjustment bound
+# (+/- 0.10, discovery/evaluate.py), and the enforced default_position_scale_cap
+# below, which caps the WHOLE sizing scale on every path.
+sizing:
+  default_position_sizing_method: fixed_fractional
+  default_risk_per_trade_pct: 0.005
+  default_position_scale_cap: 1.0
+
+# -----------------------------------------------------------------------------
+# Native strategy layer — two signal factors + a regime detector, evaluated
+# ONLY on CLOSED bars (never per tick). Entries set native ATR stop / target /
+# time-stop at order creation; exits run natively without the council.
+#   whitelist is a comma-separated scalar (the minimal YAML parser has no lists).
+# -----------------------------------------------------------------------------
+strategy:
+  # Profile selector. swing (default, the slower stack, unchanged) or active_quant
+  # (RSI-2 reversion + dual-MA momentum, two-tier + spend-ceiling cost controls,
+  # wider whitelist). Default stays swing so nothing changes silently. The
+  # active_quant block below is applied ONLY when profile is active_quant.
+  profile: swing
+  momentum_enabled: true
+  reversion_enabled: true
+  # Which mean-reversion factor the reversion slot uses: bollinger (default) or
+  # rsi2 (Connors RSI-2, long-only dips inside an uptrend).
+  reversion_style: bollinger
+  # Strategy A — trend / momentum
+  ema_fast: 20
+  ema_slow: 100
+  adx_min: 20.0
+  atr_period: 14
+  atr_vol_floor: 0.0
+  # Time-series momentum dual trend filter (OFF for swing; active_quant turns on).
+  # When on, a long also needs price above BOTH MAs (and a positive lookback
+  # return when ts_momentum_lookback > 0).
+  momentum_dual_ma_filter: false
+  momentum_medium_ma: 50
+  momentum_long_ma: 200
+  ts_momentum_lookback: 0                 # 0 = crossover only; >0 requires ret>0 over N bars
+  # Strategy B — mean reversion (whitelisted symbols only)
+  bb_period: 20
+  bb_std: 2.0
+  rsi_period: 14
+  rsi_oversold: 30.0
+  rsi_overbought: 70.0
+  vol_lookback: 20
+  vol_multiple: 1.0                       # reversion needs volume > vol_multiple * avg
+  # Connors RSI-2 mean reversion (used when reversion_style is rsi2). Long only,
+  # only above the long trend MA (dips bought inside an uptrend), with a
+  # cross-back confirmation, an ATR volatility band, and a volume filter.
+  rsi2_period: 2
+  rsi2_entry_crypto: 10.0                 # oversold trigger, looser for crypto
+  rsi2_entry_equity: 5.0                  # oversold trigger, tighter for equities
+  rsi2_exit: 67.0                         # exit when RSI-2 rises back above this (65-70)
+  rsi2_crossback_confirm: true            # wait for RSI-2 to tick back above entry
+  trend_ma_period: 200                    # long trend filter (SMA); the longest lookback
+  atr_mean_period: 100                    # ATR mean window for the volatility band
+  atr_band_std: 1.0                       # ATR must be within this many SD of its mean
+  # Regime detector (ADX + realized volatility)
+  regime_adx_trend: 25.0
+  regime_rvol_high: 0.02
+  # Direction policy (equities long-only in paper; crypto short behind this flag)
+  crypto_allow_short: false
+  # Native exits
+  atr_stop_mult: 2.0
+  atr_target_mult: 3.0
+  crypto_atr_stop_mult: 2.0               # WIDER stop for crypto (large 2-day selloffs)
+  time_stop_bars: 24
+  # Regime -> (momentum, reversion) blend weights
+  trending_momentum_weight: 0.70
+  trending_reversion_weight: 0.30
+  range_momentum_weight: 0.30
+  range_reversion_weight: 0.70
+  neutral_momentum_weight: 0.50
+  neutral_reversion_weight: 0.50
+  bar_timeframe: 5min
+  whitelist: "BTC/USD,ETH/USD,SPY,QQQ"
+
+# -----------------------------------------------------------------------------
+# active_quant profile overlay. Applied ONLY when strategy.profile is active_quant.
+# It overrides the swing base above with the evidence-backed short-term stack:
+# RSI-2 reversion, dual-MA momentum, a wider liquid whitelist, and cost controls
+# (two-tier routing + a spend ceiling) sized so a month stays near or under 100
+# dollars. Every key is operator-tunable. It never touches a Level-1 risk value.
+# The timeframe stays 5min so the existing 5Min Alpaca backfill still warms the
+# 200-period trend filter; cadence rises from RSI-2's higher signal frequency and
+# the wider whitelist, not a sub-5min bar.
+# -----------------------------------------------------------------------------
+active_quant:
+  reversion_style: rsi2
+  momentum_dual_ma_filter: true
+  ts_momentum_lookback: 20
+  bar_timeframe: 5min
+  crypto_atr_stop_mult: 2.0
+  rsi2_entry_crypto: 10.0
+  rsi2_entry_equity: 5.0
+  rsi2_exit: 67.0
+  whitelist: "BTC/USD,ETH/USD,SOL/USD,SPY,QQQ,AAPL,MSFT,NVDA"
+  fast_tier_max_notional_pct: 0.01        # entries at/below 1% of equity can fast-tier
+  fast_tier_max_conviction: 0.6           # and at/below this native strength
+  council_daily_budget: 40
+  per_symbol_council_cooldown_minutes: 60
+  council_daily_spend_ceiling_usd: 5.0
+  council_monthly_spend_ceiling_usd: 100.0
+  # Measured 2026-07-21 at $0.0562 per full round (three providers + gate) from
+  # the persisted per-provider records, reconfirmed over 41 rounds. Calibrated
+  # up from 0.04 so every ceiling above enforces against real spend: the $5/day
+  # ceiling now permits 89 calls (was 125) and the $100/month 1,786 (was 2,500).
+  # The tightening is the point; no ceiling was raised to compensate.
+  council_est_cost_per_call_usd: 0.056
+
+# -----------------------------------------------------------------------------
+# Council cost controls — the full LLM council runs ONLY on a native strategy
+# entry candidate that passes the base-check gate; never on a timer, tick, or exit.
+# council_min_confidence / council_min_agreement are SEPARATE from the Layer-1
+# gate thresholds (risk.min_confidence_default / required_model_agreement_count)
+# so they can never weaken the deterministic gate.
+# -----------------------------------------------------------------------------
+council:
+  council_daily_budget: 30
+  per_symbol_council_cooldown_minutes: 60
+  council_max_tokens: 2048   # per-provider response cap. Must leave room for a
+                             # short verdict AFTER a thinking model's reasoning.
+                             # 400 truncated Gemini 3.1 Pro before it could answer
+                             # (finishReason=MAX_TOKENS, 384 reasoning tokens, 2
+                             # chars of output). This is a ceiling, not spend: a
+                             # real verdict used ~324 tokens total.
+  council_min_confidence: 0.6
+  council_min_agreement: 2
+  # Directional votes required for a non-avoid discovery verdict. Holds abstain
+  # from the directional vote, so this counts providers that expressed a
+  # direction. 1 is DELIBERATELY PERMISSIVE, set for this evaluation period to
+  # measure whether the abstention rule produces actionable verdicts at a sane
+  # rate. 2 is the conservative setting to revisit with outcome data. The
+  # council_min_confidence floor still applies to the conviction computed among
+  # directional voters.
+  min_directional_votes: 1
+  neutral_skip_strength_threshold: 0.5
+  # Call timeouts. A full REAL council round trip (Haiku gate + three providers,
+  # Gemini 3.1 Pro doing extended thinking at council_max_tokens) takes many
+  # seconds. The engine's /score/llm wait MUST exceed it, or the engine hangs up
+  # mid-response, the bridge raises BrokenPipeError, the council returns no
+  # verdict, and nothing trades (the no-trade stall). These are the real fix.
+  engine_council_call_timeout_ms: 60000   # engine wait for /score/llm (full council)
+  engine_bridge_call_timeout_ms: 8000     # engine wait for a fast call (dnn/whale/rl/status)
+  # Whole discovery funnel pass (/discovery/run_once), NOT one round trip: Stage A
+  # over the universe through a rate-limited Finnhub client, Stage B gate calls,
+  # then up to max_council_calls_per_pass council rounds. Must be >= the council
+  # timeout. The engine peeks this call off its loop thread and never blocks, so
+  # a generous value costs nothing.
+  engine_discovery_call_timeout_ms: 300000
+  provider_timeout_seconds: 30            # bridge per-provider call; one slow provider fails alone
+  gate_timeout_seconds: 15                # bridge Haiku base-check gate call
+  # Two-tier execution (cost control). A candidate is FAST tier (native + RiskGate,
+  # NO council) only when its notional is at/below fast_tier_max_notional_pct of
+  # equity AND its native strength is at/below fast_tier_max_conviction. Swing keeps
+  # 0.0/0.0 so NO entry is fast-tiered (behavior unchanged); active_quant sets real
+  # thresholds. Both tiers respect every Level-1 limit.
+  fast_tier_max_notional_pct: 0.0
+  fast_tier_max_conviction: 0.0
+  # Hard spend ceiling (cost control). When estimated council spend (calls times
+  # council_est_cost_per_call_usd) reaches a ceiling the engine forces the fast
+  # tier, logged council_skip reason spend_ceiling. 0.0 disables. Swing leaves both
+  # 0.0; active_quant sets them so a month stays near or under 100 dollars.
+  council_est_cost_per_call_usd: 0.056   # measured 2026-07-21, was 0.04
+  council_daily_spend_ceiling_usd: 0.0
+  council_monthly_spend_ceiling_usd: 0.0
+
+# -----------------------------------------------------------------------------
+# Core-satellite hybrid sleeves. quant_core runs the systematic RSI-2 + momentum
+# stack; research_satellite uses the LLM council for deep research, taking fewer,
+# larger, longer-held positions. The split is enforced MECHANICALLY: the
+# satellite can never exceed its target plus the drift band (a hard cap in code).
+# research_satellite_enabled ships OFF so nothing changes until the operator opts
+# in. The RiskGate judges every order in BOTH sleeves with all Level-1 limits
+# unchanged. Nothing here weakens a Level-1 limit.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Week-long unattended run operations (Python-consumed only; the C++ engine
+# ignores these keys). watchdog = crash detection + ntfy notifications + one
+# clean restart. backups = nightly sqlite .backup with retention. dnn_schedule =
+# scheduled real-data challenger training (promotion stays manual + gated).
+# -----------------------------------------------------------------------------
+watchdog:
+  enabled: true
+  check_interval_seconds: 180              # health check cadence
+  bar_staleness_seconds: 900               # crypto bar older than this => stale
+  substitution_recency_window_seconds: 900 # feed_substitution is judged ONLY on bars at
+                                           # most this old. An older non-real bar is
+                                           # historical evidence from a prior run, logged
+                                           # out-of-window, never remediated (2026-07-20:
+                                           # leftover synthetic rows killed every fresh
+                                           # start). No bar inside the window is a
+                                           # freshness question, not a substitution.
+  startup_grace_seconds: 900               # measured from engine start: feed conditions
+                                           # (stale, substitution) are observed and logged
+                                           # but NOT remediated inside it. 3x the 5-min
+                                           # bar interval, so at least one live bar can
+                                           # close with margin. Engine/bridge/backend
+                                           # failures are never grace-suppressed.
+  remediation_hold_window_seconds: 1800    # the same condition recurring within this of a
+                                           # restart escalates to notify-and-hold: leave
+                                           # the stack as it is, notify loudly, stop
+                                           # restarting. A remediation loop guarantees no
+                                           # data and no diagnosis.
+  ntfy_topic: ""                           # ntfy.sh topic; empty => notifications off
+  ntfy_server: "https://ntfy.sh"
+  max_restarts_per_hour: 3                 # hard cap across ALL conditions; past it the
+                                           # watchdog holds and notifies instead of
+                                           # restarting (wired 2026-07-19, was unwired)
+
+backups:
+  enabled: true
+  dir: "backups"                           # gitignored
+  retention: 14                            # keep this many dated snapshots
+  hour_utc: 6                              # nightly backup hour (UTC)
+
+dnn_schedule:
+  challenger_training_enabled: true        # scheduled real-data challenger training
+  interval_hours: 24                       # daily attempt; refuses cleanly below min samples
+
+# Python-only (the C++ parser ignores these keys). Bridge fd telemetry: the
+# 2026-07-17 outage is consistent with fd exhaustion but unproven because no
+# fd count was recorded. The bridge reports its open-fd count in /health, logs
+# it periodically, and reads degraded at the threshold.
+bridge:
+  fd_warn_threshold: 0                     # 0 = auto: min(256, half the soft limit).
+                                           # Keys off the healthy baseline (tens of fds),
+                                           # not the limit: on 2026-07-19 the feed had
+                                           # already substituted at 410 fds while the old
+                                           # 80%-of-limit alarm (819) still read ok.
+  fd_log_interval_seconds: 300             # periodic fd log cadence in the bridge log
+  fd_trend_window_seconds: 3600            # sliding window for the rising-floor check
+  fd_trend_growth: 12                      # fd floor rise between the window's halves that
+                                           # reads degraded. The halves sit window/2 apart,
+                                           # so a steady leak shows rate*window/2 here: the
+                                           # measured ~30/hour leak shows ~15, and 12 fires
+                                           # within about an hour of onset.
+  # Promotion stays gated + MANUAL: a trained challenger waits for the operator's
+  # promote action from the GUI. auto_promote stays adaptive.dnn_auto_promote_if_better.
+
+sleeves:
+  quant_core_enabled: true
+  research_satellite_enabled: false        # OFF by default (operator opt-in)
+  quant_core_target_pct: 0.70               # 70/30 split
+  research_satellite_target_pct: 0.30       # a CEILING, not a floor: the satellite
+                                            # may sit anywhere at or under this, and
+                                            # the hard cap (target + band) is what it
+                                            # can never exceed. It earns capital by
+                                            # demonstrated paper results, it is never
+                                            # entitled to its target.
+  drift_band_pct: 0.05                      # absolute band around each target
+  research_whitelist: "BTC/USD,ETH/USD,SPY,QQQ,AAPL,MSFT,NVDA"
+  research_conviction_threshold: 0.70       # min council conviction to open a satellite position
+  research_passes_per_day: 3
+  research_daily_budget: 6                  # deep-research council calls per day
+  # The same council, so the same MEASURED $0.056/round (2026-07-23; the old
+  # 0.08 overstated research spend by 43% against the combined ceiling).
+  research_est_cost_per_call_usd: 0.056
+  rebalance_on_drift: true
+  rebalance_check_minutes: 360
+  combined_monthly_spend_ceiling_usd: 100.0 # pauses BOTH sleeves when reached (0=off)
+
+# -----------------------------------------------------------------------------
+# Discovery engine — curated universe screened cheap-to-expensive.
+#
+# SHIPS DISABLED. discovery_enabled and long_term_sleeve_enabled are both false,
+# so the engine runs the fixed-whitelist two-sleeve system exactly as before.
+# Enabling either is a deliberate operator action.
+#
+#   Stage A  free pre-screen   whole universe -> max_finalists   0 LLM tokens
+#   Stage B  Haiku gate        finalists      -> max_survivors    fractions of a cent
+#   Stage C  four-level eval   survivors      -> verdicts         full council, a few
+#
+# The UNIVERSE is the OUTER EDGE of the funnel: only LIQUID names belong here.
+# Stage A ranks all of it for free, so a wide universe costs nothing, but an
+# illiquid name surviving to Stage C wastes a full council call on something the
+# strategies cannot trade well (both RSI-2 and momentum fail on thin books).
+# Edit the two lists below to change what the funnel may ever look at.
+#
+# NOT here: the real-time news-react adaptive layer. Discovery uses Finnhub's
+# PRE-COMPUTED sentiment as a cheap number only, never live LLM news reading.
+# That layer is the next build, deferred, and will ship gated. See CONTEXT.md.
+# -----------------------------------------------------------------------------
+discovery:
+  discovery_enabled: false                  # OFF by default (operator opt-in)
+  long_term_sleeve_enabled: false           # OFF by default (operator opt-in)
+
+  # Crypto: composition SHIFTS, so a daily refresh picks the active set by
+  # liquidity and volume from this broader curated list. The refresh ranks WITHIN
+  # the list, it never discovers a new coin on its own.
+  crypto_active_max: 50
+  crypto_universe: "BTC/USD,ETH/USD,SOL/USD,XRP/USD,ADA/USD,DOGE/USD,AVAX/USD,DOT/USD,LINK/USD,MATIC/USD,LTC/USD,BCH/USD,UNI/USD,ATOM/USD,XLM/USD,ETC/USD,FIL/USD,APT/USD,ARB/USD,OP/USD,NEAR/USD,ICP/USD,IMX/USD,INJ/USD,SUI/USD,SEI/USD,TIA/USD,RNDR/USD,GRT/USD,AAVE/USD,MKR/USD,ALGO/USD,SAND/USD,MANA/USD,AXS/USD,CRV/USD,COMP/USD,SNX/USD,LDO/USD,SHIB/USD,TRX/USD,TON/USD,HBAR/USD,VET/USD,THETA/USD,EGLD/USD,FTM/USD,RUNE/USD,ZEC/USD,DASH/USD,EOS/USD,XTZ/USD,CHZ/USD,BAT/USD,YFI/USD"
+
+  # Equities: a STABLE curated list. Large caps and liquid ETFs do not churn week
+  # to week, so this is edited by hand and stays put. 110 names.
+  equity_universe: "AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,AVGO,ORCL,CRM,ADBE,AMD,INTC,CSCO,QCOM,TXN,IBM,NOW,INTU,AMAT,MU,LRCX,ADI,KLAC,SNPS,CDNS,PANW,ANET,JPM,BAC,WFC,GS,MS,C,SCHW,AXP,BLK,SPGI,CB,PGR,USB,PNC,UNH,JNJ,LLY,ABBV,MRK,PFE,TMO,ABT,DHR,AMGN,GILD,CVS,BMY,ISRG,VRTX,REGN,WMT,COST,PG,KO,PEP,MCD,NKE,SBUX,TGT,LOW,HD,TJX,DIS,CMCSA,NFLX,CAT,DE,BA,HON,UNP,UPS,LMT,RTX,GE,MMM,ADP,XOM,CVX,COP,SLB,EOG,PSX,MPC,NEE,DUK,SO,PM,MO,CL,KMB,LIN,APD,SHW,FCX,AMT,PLD,T,VZ,TMUS,SPY,QQQ,IWM,DIA,XLF,XLE,XLK,XLV,SMH,GLD,TLT,HYG"
+
+  # Hard per-stage cost ceilings. The funnel narrows: survivors <= finalists, and
+  # council calls <= survivors. Config validation enforces both.
+  max_finalists: 12                         # Stage A output (the 10-15 band)
+  max_survivors: 5                          # Stage B output (the 3-6 band)
+  max_council_calls_per_pass: 5             # Stage C ceiling per pass
+  prescreen_min_score: 0.15                 # Stage A floor (below = too quiet)
+
+  # Whale activity as a Stage-A candidate-surfacing signal. Whale data does TWO
+  # jobs, deliberately: it SURFACES candidates here (free, no LLM cost, using the
+  # already-active SEC EDGAR and crypto whale sources), and it still EVALUATES
+  # survivors as the Level-4 advisory factor at its bounded weight in Stage C. Same
+  # data, two questions, not a duplication bug.
+  #
+  # The five fixed components sum to 1.0 (momentum 0.30, volatility 0.25, gap
+  # 0.15, sentiment 0.15, native 0.15) and this adds on top before normalization,
+  # so at 0.15 whale is one sixth of the total: level with sentiment and native,
+  # below momentum and volatility. Enough to lift a name whales moved into into
+  # the finalist set, never enough to dominate the pre-screen on its own.
+  # Raise it to surface more on whale flow, lower it to surface less.
+  # 0.0 disables surfacing and restores the exact pre-whale ranking.
+  stage_a_whale_weight: 0.15
+
+  # Daily discovery council budget. SEPARATE from and ADDITIVE to the trading
+  # council budget (council.council_daily_budget), so a discovery pass can never
+  # eat the quant loop's calls. Combined monthly estimate at full use, at the
+  # MEASURED $0.056/round (every estimate now carries the same measured value,
+  # 2026-07-23): trading 40/day + discovery 12/day = 52 * $0.056 * 30 =
+  # ~$87/month worst case. Adding the research budget (6/day at $0.056) is
+  # +$10/month, so the configured caps project ~$97/month, UNDER the $100
+  # sleeves.combined_monthly_spend_ceiling_usd backstop. Far less in practice:
+  # the fast tier and Stage A drop most candidates free, and measured 72-hour
+  # production spend was $2.18. The ceiling is a backstop, not the operating
+  # point.
+  discovery_daily_council_budget: 12
+  # The same council the trading tier runs, so the same MEASURED per-round
+  # cost (usage-measured $0.05618 over 41 rounds, re-checked 2026-07-23 at
+  # unchanged provider pricing; the persisted-prompt lower bound is $0.043
+  # because Opus thinking tokens bill without being persisted).
+  discovery_est_cost_per_call_usd: 0.056
+  # Of the daily budget, this many Stage-C calls are RESERVED for the equity
+  # session (2026-07-23): crypto runs hourly around the clock and exhausted
+  # the shared pool in the first UTC hours EVERY recorded day, so equities got
+  # 2 lifetime Stage-C calls against 87 crypto. Crypto may not spend into the
+  # reservation while a US session is still ahead or open that UTC day; after
+  # the US close, and on weekends, the unused reservation is RELEASED to
+  # crypto rather than silently expiring. An allocation inside the unchanged
+  # 12-call total, never a raise.
+  discovery_equity_reserved_calls: 4
+
+  # Cadence. Crypto runs hourly around the clock (crypto never closes). Equities
+  # run at the US session open and hourly through US regular hours only.
+  crypto_interval_minutes: 60
+  equity_interval_minutes: 60
+
+  # Watchlist bounds. The universe is the wide end of the funnel, the watchlist
+  # the narrow end, so it stays capped and prunes what goes stale.
+  watchlist_max_size: 40
+  watchlist_stale_hours: 48
+
+# -----------------------------------------------------------------------------
+# Adaptive REAL-TIME layer (reads live news). SHIPS DISABLED, all three flags
+# false. With them false: no poll runs, no Finnhub client is built, no key is
+# read, no socket opens, no token is spent, and the engine consumes no action.
+# Behavior is exactly as if this block did not exist.
+#
+# NOT the `adaptive:` block above. That one is the LEARNING tuner, which tunes
+# factor weights from closed-trade PnL. This one reads headlines. They share a
+# word and nothing else.
+#
+# THE ASYMMETRY, which is the reason this layer is allowed to exist at all:
+# a live event can make the engine MORE CAUTIOUS directly (trim, exit, flag for
+# review) and can NEVER make it more aggressive directly. There are exactly three
+# flags below and none of them enables event-driven entry, because there is no
+# such code path to enable. A bullish read becomes a watchlist REFERRAL: the
+# symbol is offered to the discovery funnel, and Stage A, Stage B, the four
+# levels, and the RiskGate all still have to agree before anything is bought. A
+# misread headline costs a screening slot and a fraction of a cent, never a
+# position. See CONTEXT.md and LIVE_READINESS.md.
+#
+# Cost: the feed is free (Finnhub free tier). The ONLY paid stage is one cheap
+# Haiku read per ESCALATED event, and an event only escalates after a free
+# no-LLM filter (keywords, sentiment magnitude, event type) keeps it. Worst case
+# is adaptive_daily_llm_budget * adaptive_est_cost_per_call_usd = 20 * $0.02 =
+# $0.40/day, a budget SEPARATE from and ADDITIVE to both the discovery budget and
+# the trading council budget, so this layer can never eat either one's calls.
+# -----------------------------------------------------------------------------
+adaptive_realtime:
+  # The OBSERVE half's master flag. The other two are downstream of a poll, so
+  # with this false they cannot do anything whatever they are set to.
+  adaptive_news_feed_enabled: false         # OFF by default (operator opt-in)
+  # The SAFE half: add funnel referrals, prune the watchlist. Changes what the
+  # system LOOKS AT, never what it holds. Enableable on its own.
+  adaptive_watchlist_shaping_enabled: false # OFF by default (operator opt-in)
+  # The REACT half: the only flag that lets an event change a POSITION, and it
+  # can only ever shrink or freeze one.
+  adaptive_react_defensive_enabled: false   # OFF by default (operator opt-in)
+
+  # Feed. Once a minute sits far inside the Finnhub free tier (60 calls/min).
+  poll_interval_seconds: 60
+  max_symbols_per_poll: 25                  # 2N+1 calls/poll; free tier is 60/min
+  news_lookback_minutes: 15                 # wider than the interval: a missed
+                                            # poll must not lose events
+  general_news_enabled: true                # macro events that name no symbol
+
+  # Free materiality filter (NO LLM). Deliberately generous: a false positive
+  # costs one cheap call, a false negative misses an event outright.
+  materiality_min_sentiment: 0.55
+
+  # Interpretation: the only paid stage.
+  adaptive_daily_llm_budget: 20             # hard ceiling, separate + additive
+  adaptive_est_cost_per_call_usd: 0.02
+  max_interpretations_per_poll: 3           # one news storm cannot spend the day
+  interpretation_model: claude-haiku-4-5
+  interpretation_min_relevance: 0.40
+
+  # Action bounds. Enforced engine-side as well as Python-side.
+  action_min_severity: 0.60                 # below this an event causes nothing
+  action_max_age_seconds: 300               # stale news must not move a position
+  defensive_trim_fraction: 0.50             # what a `trim` closes
+
+# -----------------------------------------------------------------------------
+# RL advisory (Layer 3, DEFERRED). Ships toggled OFF. While rl_enabled is false
+# the engine never scores an RL factor and it stays out of the ensemble entirely.
+# The PPO trainer (rl_advisory/) refuses to run until at least rl_min_real_fills
+# REAL closed fills exist — there is NO synthetic-data training path for RL.
+# Advisory only: its factor weight ships 0.0, its scale hint is clamped to 0.5
+# at the source, and RL can never be a sole execution controller. Promotion
+# stays gated + manual.
+# -----------------------------------------------------------------------------
+rl:
+  rl_enabled: false                      # OFF by default (ships toggled off)
+  rl_min_real_fills: 500                 # training gate: real closed fills required
+
+# -----------------------------------------------------------------------------
+# Offline simulation (how the OFFLINE loop is DRIVEN — never affects live).
+# The offline paper loop is the continuous training environment; these controls
+# let it generate real native fills that feed the real-fill tuner, train_real,
+# and (once enabled + past its gate) RL. NOTE: Alpaca is a PAPER + MARKET-DATA
+# venue only. It has no live brokerage path and must never be wired to one.
+#   feed_mode  : alpaca_paper (primary ONLINE loop) | flat_random_walk (default) |
+#                synthetic_regimes | replay
+#     - alpaca_paper: the primary online loop. Pulls live market data from Alpaca
+#       and routes paper orders to Alpaca paper (needs --bridge). Alpaca is paper
+#       and market data only, with no live path.
+#     - synthetic_regimes: TEST tool. Deterministic trending/range/volatile legs
+#       that cross the ADX + realized-vol thresholds so momentum AND reversion
+#       enter. For tests and threshold tuning.
+#     - replay: TEST tool. Drives the loop from real bars already in the 'bars'
+#       table (run the Alpaca historical backfill first). Fails loudly if the
+#       range is empty.
+#     - flat_random_walk: retained for existing tests. Default so tests do not shift.
+#   clock_mode : real (wall-clock; online Alpaca loop + continuous mode) | simulated
+#     (bar time advances internally so finite/synthetic runs actually close bars).
+# -----------------------------------------------------------------------------
+# Global-session equity rotation (future live phase). SCAFFOLD, DISABLED.
+# The equity sleeve would follow the open regional market, Asia then London then
+# NY, trading each region's equities during its session. It ships DISABLED because
+# the paper venue Alpaca is US-only and cannot reach Asian or European exchanges.
+# THE safety rule: the engine only trades an equity region when a connected venue
+# can reach that region's exchange. Today only NY (Alpaca) is reachable, so only
+# US equities trade during US hours, exactly as now. London and Asia are defined
+# but venue_available false. Enabling rotation requires IBKR global market access,
+# per-region equity whitelists, and global_equity_rotation_enabled true, and it
+# stays off until the operator is deliberately live on IBKR. Hours are minutes
+# since UTC midnight (the local exchange session converted to UTC).
+# -----------------------------------------------------------------------------
+global_sessions:
+  global_equity_rotation_enabled: false   # SCAFFOLD, DISABLED. Always false for now.
+  ny_exchange: us_equities
+  ny_tz: America/New_York
+  ny_open_utc_min: 810                     # 13:30 UTC (09:30 ET)
+  ny_close_utc_min: 1200                   # 20:00 UTC (16:00 ET)
+  ny_venue_available: true                 # Alpaca reaches US equities
+  ny_whitelist: "SPY,QQQ,AAPL,MSFT,NVDA"   # placeholder, the current US set
+  london_exchange: lse
+  london_tz: Europe/London
+  london_open_utc_min: 480                 # 08:00 UTC
+  london_close_utc_min: 990                # 16:30 UTC
+  london_venue_available: false            # no connected venue reaches the LSE
+  london_whitelist: ""                     # placeholder, empty until IBKR
+  asia_exchange: tse
+  asia_tz: Asia/Tokyo
+  asia_open_utc_min: 0                      # 00:00 UTC (09:00 JST)
+  asia_close_utc_min: 360                   # 06:00 UTC (15:00 JST)
+  asia_venue_available: false               # no connected venue reaches the TSE
+  asia_whitelist: ""                        # placeholder, empty until IBKR
+
+# -----------------------------------------------------------------------------
+simulation:
+  feed_mode: flat_random_walk
+  clock_mode: real
+  synthetic_seed: 42
+  replay_start_date: ""                  # inclusive YYYY-MM-DD ("" = earliest stored)
+  replay_end_date: ""                    # inclusive YYYY-MM-DD ("" = latest stored)
+  replay_speed: fast                     # fast (ignore wall-clock) | realtime
+
+# -----------------------------------------------------------------------------
+# IBKR live venue. IBKR handles live trading only. It connects to a locally run
+# IB Gateway session that the operator starts and authenticates. No IBKR
+# credentials pass through this app. IBKR stays disabled behind the approval
+# gate. connection_enabled only allows a health check and, when the operator
+# later opens the live gate, live routing. It does NOT enable live trading by
+# itself. Default false.
+# -----------------------------------------------------------------------------
+ibkr:
+  gateway_host: 127.0.0.1
+  gateway_port: 4001                     # IB Gateway live socket (4002 = paper GW)
+  connection_enabled: false              # health check + future live routing; OFF
+  market_data: false                     # use Alpaca for market data; IBKR data off
+
+# -----------------------------------------------------------------------------
+# Adaptive learning (Layer 2) — bounded, logged, rollback-capable
+# -----------------------------------------------------------------------------
+adaptive:
+  adaptive_learning_enabled: true
+  adaptive_weight_updates_enabled: true
+  manual_weight_override_priority: true        # manual weights win over adaptive
+  # Floor on the rule_based (native) signal weight. Two effects: the tuner never
+  # nudges the raw weight below it, and the gate verdict guarantees rule_based at
+  # least this NORMALIZED share so advisory factors at the cap cannot dilute the
+  # native conviction and stall entries. Advisory bound, no risk limit.
+  rule_based_weight_floor: 0.35
+  adaptive_threshold_update_frequency_trades: 25
+  dnn_retrain_frequency_trades: 50
+  dnn_challenger_evaluation_window_trades: 100
+  dnn_auto_promote_if_better: false            # promotion is a manual/gated action
+  rollback_on_metric_degradation: true
+
+# -----------------------------------------------------------------------------
+# Whale / smart-money (Layer 4)
+# -----------------------------------------------------------------------------
+whale:
+  whale_tracking_enabled: true
+  # Full-activation defaults (2026-07-13). SEC EDGAR is the free, keyless, active
+  # whale feed; whale_live_enabled is the master live switch. These declare the
+  # intended live state and are exported to the bridge environment by
+  # scripts/start_paper_trading.sh (SEC_EDGAR_ENABLED / WHALE_LIVE_ENABLED). The
+  # whale library itself still treats live fetch as an env opt-in that defaults
+  # OFF, so any process that is not the deliberate start command stays offline
+  # and safe. The per-layer source toggle can override whale to on-mock at
+  # runtime without stopping the run.
+  sec_edgar_enabled: true
+  whale_live_enabled: true
+  # Whale Alert crypto whale feed, wired for a one-time TRIAL evaluation. Default
+  # OFF, so the system runs unchanged. When true AND WHALE_ALERT_API_KEY resolves,
+  # the Whale Alert adapter joins the whale chain for crypto and feeds the same
+  # advisory factor as SEC EDGAR, at the same bounded weight. Exported to the bridge
+  # env as WHALE_ALERT_ENABLED by scripts/start_paper_trading.sh. The key is a
+  # RESERVED credential, resolved keystore-first, never committed here. This is a
+  # deliberate one-time trial, not a recurring free-tier scheme.
+  whale_alert_enabled: false
+  whale_signal_weight: 0.10
+  whale_min_activity_score: 0.60
+  whale_min_historical_usefulness: 0.55
+  whale_max_signal_age_minutes: 15
+  whale_contradiction_penalty_enabled: true
+  whale_auto_disable_if_unhelpful: true
+
+# -----------------------------------------------------------------------------
+# Live approval gate — ALL must hold before live can be enabled in-app
+# -----------------------------------------------------------------------------
+live_approval:
+  live_approval_required: true
+  live_requires_connected_credentials: true
+  live_requires_kill_switch_configured: true
+  live_requires_recent_performance_visible: true
+  live_requires_manual_confirmation: true
+  live_requires_positive_paper_expectancy: true
+  live_requires_drawdown_below_pct: 0.05
+
+# -----------------------------------------------------------------------------
+# Dashboard
+# -----------------------------------------------------------------------------
+dashboard:
+  dashboard_refresh_seconds: 5
+  trade_feed_page_size: 50
+  equity_curve_default_window_days: 30
+  pnl_chart_default_window_days: 7
+  show_model_verdict_board_by_default: true
+  show_weight_control_panel_by_default: true
+  show_dnn_panel_by_default: true
+  show_whale_panel_by_default: true
+
+# -----------------------------------------------------------------------------
+# Model-weight defaults (ensemble). Editable in UI, auto-normalized,
+# resettable to defaults, lockable against adaptive change.
+# -----------------------------------------------------------------------------
+model_weights:
+  llm_primary_weight: 0.27
+  llm_secondary_weight: 0.18
+  llm_tertiary_weight: 0.12
+  rule_based_factor_weight: 0.18
+  # DEACTIVATED BY ZERO WEIGHT, NOT REMOVED (2026-07-27). A weight of 0.0 drops
+  # the factor from `used` in signal_engine::combine, so it contributes nothing
+  # to composed confidence, edge, or bias and never sits in the denominator.
+  # Every code path stays wired and callable: restoring a weight reactivates
+  # the layer with no other change.
+  #
+  # WHY: composed confidence is the weight-normalised MEAN of participating
+  # factors, so a factor with no demonstrated skill reporting below that mean
+  # lowers it and suppresses trades while no threshold moves. Neither of these
+  # has a measured basis. dnn_advisory has served a synthetic-trained champion
+  # throughout and never passed its real-data promotion gate. The whale layer
+  # has never been scored against outcomes at all. A factor earns its weight by
+  # measurement; until then it contributes zero rather than a share of a mean.
+  dnn_advisory_factor_weight: 0.0    # was 0.15
+  whale_signal_factor_weight: 0.0    # was 0.10
+  # sum = 0.75 (was 1.00 when dnn_advisory and whale_signal carried weight).
+  # combine() re-normalises across the factors that actually produced a signal,
+  # so the sum is not required to be 1.00 and the relative weights of the
+  # remaining factors are unchanged by the deactivation.
+  rl_advisory_factor_weight: 0.0         # deferred RL factor; 0.0 = non-decisive
+                                         # even once rl_enabled — operator-tunable
+                                         # in the UI; excluded from normalization
+                                         # while zero, so the sum stays 1.00.
+
+# -----------------------------------------------------------------------------
+# LLM advisory model identities — the concrete model each ensemble slot uses.
+# This is the single source of truth for the model names; the consensus engine
+# and the dashboard's advisory panels both read these strings, so the UI always
+# shows the exact model in use and stays accurate when you swap a model here.
+# `llm_gate` is the cheap model used for the pre-council base-check.
+# These are the only approved model strings (see CLAUDE.md); do not invent others.
+# -----------------------------------------------------------------------------
+llm_models:
+  llm_primary: gpt-5.5                 # OpenAI    (env OPENAI_API_KEY)
+  llm_secondary: claude-opus-4-8       # Anthropic (env ANTHROPIC_API_KEY)
+  llm_tertiary: gemini-3.1-pro-preview # Google    (env GEMINI_API_KEY) — reachable id for Gemini 3.1 Pro
+  llm_gate: claude-haiku-4-5           # base-check gate via the Anthropic client (env ANTHROPIC_API_KEY)
+
+# -----------------------------------------------------------------------------
+# LLM council (Layer 2 advisory) — real multi-provider consensus.
+#
+#   use_real_council: when TRUE *and* the engine is launched with --bridge, the
+#     llm_ ensemble factors are scored by the REAL council (OpenAI / Anthropic /
+#     Google) instead of the in-process C++ mock. Default FALSE so the offline
+#     paper loop stays deterministic and key-free. Any provider whose API key
+#     env var is absent returns a clearly-labelled MOCK verdict (never crashes),
+#     so turning this on never forces the system offline.
+#   gate_enabled: run the cheap Claude Haiku base-check before the three
+#     expensive providers. If the gate says "not worth a full review" the council
+#     is skipped and a flat/neutral verdict is returned (cost control). Default
+#     TRUE. The gate reuses the council's ANTHROPIC_API_KEY (no new credential);
+#     without it the gate runs in permissive mock mode (always proceeds) so
+#     offline behaviour is unchanged.
+# -----------------------------------------------------------------------------
+llm:
+  # Full four-level activation default (2026-07-13). TRUE assumes the operator
+  # runs the Python bridge and holds keystore keys; without --bridge the loop
+  # stays in-process mock, and any provider without a resolvable key degrades to
+  # a labelled mock. The per-layer source toggle (controls.json) can override the
+  # council to on-mock at runtime without stopping the run.
+  use_real_council: true
+  gate_enabled: true
+
+# -----------------------------------------------------------------------------
+# External data sources (set credentials on the in-app Accounts/Connections
+# page or via environment variables — see .env.example). Keys are NEVER stored
+# in this file.
+# -----------------------------------------------------------------------------
+data_sources:
+  whale_alert:
+    enabled: true
+    base_url: "https://api.whale-alert.io/v1"
+    min_value_usd: 500000
+    api_key_env: WHALE_ALERT_API_KEY
+  sec_api_13f:
+    enabled: true
+    base_url: "https://api.sec-api.io"
+    endpoint: "/form-13f/holdings"
+    note: "DELAYED institutional holdings disclosure — NOT live trade flow."
+    api_key_env: SEC_API_KEY
+
+# -----------------------------------------------------------------------------
+# Fee model (2026-07-26). Costs come from PUBLISHED LIVE SCHEDULES, never from
+# paper fills. A paper venue is an execution simulator whose fee reporting is
+# not evidence. The engine records this model's cost on every fill beside the
+# venue's reported figure, and the backtest harness prices every trade with it.
+# The engine sends market orders, which pay the taker rate.
+# -----------------------------------------------------------------------------
+fees:
+  # Alpaca crypto: volume-tiered maker/taker on notional. Base tier applies
+  # under 100000 USD of 30-day crypto volume. Sizing at 0.5 percent of 100k
+  # equity keeps this account in the base tier indefinitely.
+  # Source: Alpaca published crypto fee schedule, read 2026-07-26. Tier table
+  # (30-day volume USD, maker pct / taker pct), recorded so a tier change is
+  # visible: <100k 0.15/0.25, 100k-500k 0.12/0.22, 500k-1M 0.10/0.20,
+  # 1M-10M 0.08/0.18, 10M-25M 0.05/0.15, 25M-50M 0.02/0.10.
+  # The machine-readable tier table lives in backtest/fees.py.
+  alpaca_crypto_maker_pct: 0.15
+  alpaca_crypto_taker_pct: 0.25
+  alpaca_crypto_tier_volume_threshold_usd: 100000
+  # Crypto spread beyond the taker fee: not established from any schedule.
+  # Recorded 0 with this note rather than guessed.
+  alpaca_crypto_spread_bp_per_side: 0.0
+  # Alpaca US equities: commission free. Regulatory (SEC fee plus FINRA TAF,
+  # sells only, about 0.3 bp averaged over both sides) and a spread component.
+  # The spread figure is an estimate, stated as one, not a schedule value.
+  # Source: Alpaca published equity fee disclosure, read 2026-07-26.
+  alpaca_equity_commission_bp: 0.0
+  alpaca_equity_regulatory_bp_per_side: 0.15
+  # THE FLAT SPREAD ESTIMATE, UNCHANGED AT 0.5, now the fallback used only when
+  # a symbol's liquidity is unknown. It was never measured: the 2026-07-26
+  # session recorded it as an estimate. Measured 2026-07-27 it is about right
+  # for the top 500 by liquidity (floor 0.42 bp per side) and too low by 5x or
+  # more below that. See the liquidity model below.
+  alpaca_equity_spread_bp_per_side: 0.5
+  # ---------------------------------------------------------------------
+  # LIQUIDITY-AWARE EQUITY COST (2026-07-27). A single figure calibrated on
+  # large caps does not apply to small ones, so cost now varies with the
+  # symbol's own price and its median daily dollar volume.
+  #
+  # SPREAD IS A FLOOR, NOT AN ESTIMATE, AND THE DISTINCTION IS THE POINT.
+  # One cent is the minimum quoted increment for a US equity above 1.00 USD
+  # (SEC Reg NMS Rule 612), so a one-tick market is the tightest any name can
+  # be and the floor is exactly tick/price. Per side that is half of it.
+  # Real small caps quote SEVERAL ticks wide, and no quote data exists in this
+  # project to measure how many, so the multiple ships at 1.0 and the model
+  # therefore UNDERSTATES small-cap spread by construction. Raise the multiple
+  # when quote data is available. Recorded this way rather than guessed, the
+  # same posture as alpaca_crypto_spread_bp_per_side above.
+  # Source: SEC Reg NMS Rule 612 minimum pricing increment, read 2026-07-27.
+  alpaca_equity_spread_tick_usd: 0.01
+  alpaca_equity_spread_tick_multiple: 1.0
+  # IMPACT IS MEASURED. Amihud (2002) illiquidity, mean(|return| / dollar
+  # volume), computed per symbol over 2025-07-01 to 2026-07-24 on 11,710 US
+  # equities priced at or above 1.00 USD in analysis_bars.db (consolidated SIP,
+  # adjustment=all), then the median within each liquidity band. Expressed as
+  # bp per side per 1,000 USD of notional so the value is a plain decimal and
+  # scales linearly with order size.
+  # Amihud is a DAILY aggregate applied to a single order, which overstates.
+  # That is the conservative direction for a cost. Measured 2026-07-27, method
+  # and distribution in RETURN.md.
+  # Tier floors are the measured median daily dollar volume at each band edge.
+  alpaca_equity_tier1_adv_floor_usd: 277000000
+  alpaca_equity_tier2_adv_floor_usd: 65300000
+  alpaca_equity_tier3_adv_floor_usd: 13300000
+  alpaca_equity_tier4_adv_floor_usd: 2070000
+  alpaca_equity_tier5_adv_floor_usd: 235000
+  alpaca_equity_tier1_impact_bp_per_1k: 0.00024
+  alpaca_equity_tier2_impact_bp_per_1k: 0.00114
+  alpaca_equity_tier3_impact_bp_per_1k: 0.00543
+  alpaca_equity_tier4_impact_bp_per_1k: 0.02847
+  alpaca_equity_tier5_impact_bp_per_1k: 0.17320
+  alpaca_equity_tier6_impact_bp_per_1k: 3.86400
+  # IBKR (live-only path): US equities Pro pricing is tiered 0.0035 USD/share
+  # (min 0.35 USD) or fixed 0.005 USD/share (min 1 USD). WHICH PLAN THIS
+  # ACCOUNT USES COULD NOT BE ESTABLISHED this session. Recorded as not
+  # established rather than guessed. Source: IBKR published pricing page,
+  # read 2026-07-26.
+  ibkr_established: false

@@ -1,0 +1,367 @@
+"""Multi-LLM consensus ensemble (the "council").
+
+Produces a consensus directional verdict from several LLM providers. Three real
+providers (OpenAI / Anthropic / Google) plug in behind API keys; when a key is
+absent that provider degrades to a clearly-labelled deterministic mock, so the
+offline demo needs no keys. A cheap Claude Haiku base-check gate can skip the
+whole council for low-signal setups (cost control).
+
+Output is ADVISORY ONLY — it enters the C++ factor-combination engine as
+weighted factors and can never bypass Layer-1 risk.
+
+Which council runs is controlled by config (``config/default_config.yaml``):
+  * llm.use_real_council (default false) -> real providers vs mock.
+  * llm.gate_enabled     (default true)  -> run the base-check gate first.
+The engine only swaps in the real council when use_real_council is true AND it
+is launched with ``--bridge`` (see core/main.cpp + python_bridge).
+"""
+from __future__ import annotations
+
+# Re-exported here so existing imports (`from llm_consensus.consensus import ...`)
+# keep working after the split into focused modules.
+from .config_access import (  # noqa: F401
+    council_max_tokens, equities_market_hours_only, gate_enabled,
+    gate_timeout_seconds, llm_model_names, provider_timeout_seconds,
+    slot_weight, use_real_council,
+)
+from .gate import AlwaysProceedGate, GateDecision, HaikuGate  # noqa: F401
+from .providers import (  # noqa: F401
+    AnthropicProvider, GeminiProvider, LLMProvider, MockLLMProvider,
+    OpenAIProvider,
+)
+from .provider_health import (  # noqa: F401
+    exhausted_providers, exhaustion_line, is_exhausted as provider_is_exhausted,
+)
+from .verdicts import (  # noqa: F401
+    ConsensusResult, ModelVerdict, _det_unit, bias_to_verdict, is_error,
+    is_exhausted,
+)
+
+# Provider "personality" skews — kept identical to the original ensemble so the
+# offline mock behaviour (and its tests) are unchanged.
+_SLOT_SKEW: dict[str, float] = {
+    "llm_primary": 0.10,
+    "llm_secondary": -0.05,
+    "llm_tertiary": 0.0,
+}
+
+
+def default_providers(cfg_path: str | None = None) -> list[LLMProvider]:
+    """The three ensemble slots as deterministic offline MOCK providers."""
+    names = llm_model_names(cfg_path)
+    return [
+        MockLLMProvider(name=slot, weight=slot_weight(slot, cfg_path),
+                        skew=_SLOT_SKEW[slot], model_id=names.get(slot, ""))
+        for slot in ("llm_primary", "llm_secondary", "llm_tertiary")
+    ]
+
+
+def real_providers(cfg_path: str | None = None) -> list[LLMProvider]:
+    """The three ensemble slots as REAL API-backed providers.
+
+    Slot -> provider mapping matches the ``llm_models`` config block:
+      llm_primary   = OpenAI    (gpt-5.5)
+      llm_secondary = Anthropic (claude-opus-4-8)
+      llm_tertiary  = Google    (gemini-3.1-pro-preview)
+    Each still degrades to a labelled mock when its key is absent.
+    """
+    names = llm_model_names(cfg_path)
+    max_tok = council_max_tokens(cfg_path)
+    # Per-provider call timeout from config: a slow or hung provider fails alone
+    # after this, the council proceeds on the rest (Task 4).
+    ptimeout = provider_timeout_seconds(cfg_path)
+    return [
+        OpenAIProvider(name="llm_primary",
+                       weight=slot_weight("llm_primary", cfg_path),
+                       model_id=names.get("llm_primary", "gpt-5.5"),
+                       skew=_SLOT_SKEW["llm_primary"], max_tokens=max_tok,
+                       timeout=ptimeout, cfg_path=cfg_path),
+        AnthropicProvider(name="llm_secondary",
+                          weight=slot_weight("llm_secondary", cfg_path),
+                          model_id=names.get("llm_secondary", "claude-opus-4-8"),
+                          skew=_SLOT_SKEW["llm_secondary"], max_tokens=max_tok,
+                          timeout=ptimeout, cfg_path=cfg_path),
+        GeminiProvider(name="llm_tertiary",
+                       weight=slot_weight("llm_tertiary", cfg_path),
+                       model_id=names.get("llm_tertiary", "gemini-3.1-pro-preview"),
+                       skew=_SLOT_SKEW["llm_tertiary"], max_tokens=max_tok,
+                       timeout=ptimeout, cfg_path=cfg_path),
+    ]
+
+
+def build_council(cfg_path: str | None = None) -> list[LLMProvider]:
+    """Real council when llm.use_real_council is set, else the mock council."""
+    if use_real_council(cfg_path):
+        return real_providers(cfg_path)
+    return default_providers(cfg_path)
+
+
+def build_gate(cfg_path: str | None = None):
+    """The base-check gate, or a no-op AlwaysProceedGate when disabled."""
+    if not gate_enabled(cfg_path):
+        return AlwaysProceedGate(reason="gate disabled by config", source="disabled")
+    return HaikuGate(model_id=llm_model_names(cfg_path).get(
+        "llm_gate", "claude-haiku-4-5"),
+        timeout=gate_timeout_seconds(cfg_path))
+
+
+def _flat_consensus(gate: GateDecision) -> ConsensusResult:
+    """Neutral council verdict returned when the gate skips the review."""
+    return ConsensusResult(
+        bias=0.0, confidence=0.0, edge=0.0, verdict=bias_to_verdict(0.0),
+        agreement_count=0, per_model=[], gate=gate.to_dict())
+
+
+def _refused_consensus(refusal) -> ConsensusResult:
+    """Neutral verdict returned when the evidence cannot answer the question.
+
+    Structurally identical downstream to any other flat result (per_model
+    empty, so the discovery budget charges zero and build_verdict lands on
+    avoid), and distinguishable from every other flat result by carrying the
+    reason. A refusal is not a hold: nobody was asked.
+    """
+    return ConsensusResult(
+        bias=0.0, confidence=0.0, edge=0.0, verdict=bias_to_verdict(0.0),
+        agreement_count=0, per_model=[], refusal=refusal.to_dict())
+
+
+# The system's only equities (native-strategy whitelist). The market-hours cost
+# cut targets exactly these; crypto (BTC/USD, ETH/USD) trades 24/7.
+_EQUITY_SYMBOLS = frozenset({"SPY", "QQQ"})
+
+
+def _risk_precheck_skip(state: dict) -> GateDecision | None:
+    """Cost cut 1 (Task 5): skip the council when the trade is already blocked.
+
+    The C++ engine evaluates the cheap RiskGate preconditions READ-ONLY and, when
+    a hard limit already blocks the trade, marks the /score/llm payload. The
+    council then never runs (no base-check gate, no providers) — a doomed trade cannot
+    be rescued by the council. This honours the engine's gate result; it does not
+    re-implement or modify any gate logic. Returns a skip decision or None.
+    """
+    if not (state.get("risk_precheck_block") or state.get("risk_blocked")):
+        return None
+    reason = str(state.get("risk_precheck_reason")
+                 or state.get("risk_reason") or "risk precondition blocks trade")
+    return GateDecision(False, f"risk pre-check: {reason}", "risk_precheck",
+                        "risk_precheck")
+
+
+def _market_hours_skip(state: dict, cfg_path: str | None) -> GateDecision | None:
+    """Cost cut 2 (Task 5): equities skip the council outside US trading hours.
+
+    Fires only for the whitelisted equities (SPY, QQQ) when the US session is
+    closed; crypto is never skipped for market hours. The caller may pass an
+    explicit ``market_open`` bool (deterministic for tests); otherwise it is
+    computed from the current UTC time. Returns a skip decision or None.
+    """
+    if not equities_market_hours_only(cfg_path):
+        return None
+    symbol = str(state.get("symbol", "")).strip().upper()
+    if symbol not in _EQUITY_SYMBOLS:
+        return None                      # crypto / unknown -> never a MH skip
+    if _market_open(state):
+        return None
+    return GateDecision(False, "equities outside US regular trading hours",
+                        "market_hours", "market_hours")
+
+
+def _market_open(state: dict) -> bool:
+    if "market_open" in state:
+        return bool(state["market_open"])
+    return _us_equity_market_open_now()
+
+
+def _us_equity_market_open_now(now=None) -> bool:
+    """Approximate US regular trading hours in UTC (~13:30-20:00, Mon-Fri).
+
+    DST is not modelled — this is an advisory cost-cut heuristic, not a risk
+    control. The C++ engine owns the authoritative market-hours check for the
+    running loop; this fallback exists so a direct Python caller behaves sanely.
+    """
+    from datetime import datetime, timezone
+    now = now or datetime.now(timezone.utc)
+    if now.weekday() >= 5:               # Saturday / Sunday
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 13 * 60 + 30 <= minutes < 20 * 60
+
+
+def _score_all(prov: list[LLMProvider], state: dict) -> list[ModelVerdict]:
+    """Score every provider concurrently, preserving order. A slow provider only
+    delays the council by its own timeout, never the sum. score() never raises
+    (each provider degrades to a flat verdict), so this cannot fail the council."""
+    if len(prov) <= 1:
+        return [p.score(state) for p in prov]
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(prov)) as ex:
+            return list(ex.map(lambda p: p.score(state), prov))
+    except Exception:  # pragma: no cover - thread pool unavailable
+        return [p.score(state) for p in prov]
+
+
+def consensus(state: dict, providers: list[LLMProvider] | None = None,
+              gate=None, cfg_path: str | None = None) -> ConsensusResult:
+    """Weighted ensemble of provider verdicts into one consensus.
+
+    Runs the base-check gate first; if it declines, returns a flat verdict and
+    skips the (expensive) providers entirely. The ensemble math itself is
+    unchanged from the original mock-only implementation.
+
+    Two council cost cuts run BEFORE the base-check gate + providers (Task 5): a risk
+    pre-check (skip when the engine's read-only RiskGate already blocks the
+    trade) and a market-hours skip (equities outside US RTH). Each returns a flat
+    verdict whose gate reason the engine logs as ``risk_precheck`` / ``market_hours``.
+    """
+    risk_skip = _risk_precheck_skip(state)
+    if risk_skip is not None:
+        return _flat_consensus(risk_skip)
+    mh_skip = _market_hours_skip(state, cfg_path)
+    if mh_skip is not None:
+        return _flat_consensus(mh_skip)
+
+    # THE EVIDENCE BUILDER, ONE FOR BOTH COUNCIL PATHS (2026-07-25). Every
+    # council call, trading or discovery, assembles its evidence here and
+    # nowhere else: the quote fields under their declared units and scales,
+    # then the recorded sections (real-provenance bars checked against that
+    # price, the engine's regime read, position state). The gate and every
+    # provider then read the SAME assembled state. No db key means no
+    # enrichment and no persistence, which is what keeps unit tests hermetic.
+    # A new dict is built rather than mutating the caller's.
+    from .evidence import build_state, evidence_refusal
+    state = build_state(state, db_path=state.get("db"))
+
+    # REFUSE TO ASK A QUESTION THE EVIDENCE CANNOT ANSWER (2026-07-25). Ten
+    # consecutive discovery rounds spent three provider calls each to be told,
+    # by all three providers in writing, that the evidence lacked what a read
+    # needs. The minimum is defined in evidence.py; falling below it is a
+    # refusal recorded with its reason, not a purchased abstention. This can
+    # only skip spend: a state that clears the minimum reaches the gate and
+    # the providers exactly as before.
+    refusal = evidence_refusal(state)
+    if refusal is not None:
+        result = _refused_consensus(refusal)
+        if state.get("db"):
+            from .persist import record_refusal
+            record_refusal(str(state["db"]), state, refusal, cfg_path=cfg_path)
+        return result
+
+    g = gate if gate is not None else build_gate(cfg_path)
+    decision = g.should_review(state)
+    if not decision.proceed:
+        return _flat_consensus(decision)
+
+    prov = providers if providers is not None else build_council(cfg_path)
+    # Score the providers CONCURRENTLY so a single slow or hung provider only
+    # delays the council by its OWN timeout, not the sum of all three (Task 4).
+    # Each provider's score() already catches its own errors and returns a flat
+    # verdict, so this never raises and order is preserved. Falls back to a plain
+    # sequential map if a thread pool cannot be created.
+    verdicts = _score_all(prov, state)
+
+    # A hold ABSTAINS from the directional vote (2026-07-18). The old rule
+    # averaged holds (bias 0, confidence ~0.5) into the ensemble, which made
+    # direction and conviction anti-correlated by construction: one convinced
+    # provider plus two holds averaged to ~0.55 against a 0.60 floor, while
+    # unanimous holds averaged HIGH exactly when there was no direction. Across
+    # all 12 real discovery verdicts ever produced, no directional read ever
+    # cleared the floor and no floor-clearing read was ever directional.
+    #
+    # Now bias, conviction, and edge are computed over DIRECTIONAL voters only.
+    # A hold is still scored, still in per_model, still logged: it abstains, it
+    # does not dilute. Zero directional voters means flat at conviction 0.0
+    # (there is nothing to be convinced OF), which downstream reads as avoid.
+    # Agreement counts directional voters agreeing with the net direction, so a
+    # hold no longer inflates agreement on the short side (the old sign test
+    # counted bias 0.0 as -1, which is how one seller plus two holds recorded
+    # agreement 3).
+    directional = [(v, p) for v, p in zip(verdicts, prov)
+                   if abs(v.bias) > 1e-9]
+    # A FAILED CALL IS NOT AN ABSTENTION (2026-07-25). Both are non-directional
+    # and both stay out of the math below, which is unchanged: an errored
+    # verdict carries bias 0.0, so it was never in `directional` and never
+    # contributed to bias, confidence, edge, or agreement. What changes is only
+    # the COUNT a human reads. Splitting them here is why council_eval stops
+    # saying three providers held when two held and one never answered.
+    # THREE DISJOINT NON-DIRECTIONAL OUTCOMES (2026-07-27). is_error covers
+    # every non-answer so the abstention subtraction stays honest; exhaustion
+    # is then split back out, because an account out of quota is not a call
+    # that failed and is not a provider that read the evidence and held.
+    exhausted = sum(1 for v in verdicts if is_exhausted(v))
+    errors = sum(1 for v in verdicts if is_error(v)) - exhausted
+    abstentions = len(verdicts) - len(directional) - errors - exhausted
+    if directional:
+        dwsum = sum(p.weight for _, p in directional) or 1.0
+        bias = sum(v.bias * p.weight for v, p in directional) / dwsum
+        conf = sum(v.confidence * p.weight for v, p in directional) / dwsum
+        edge = sum(v.edge * p.weight for v, p in directional) / dwsum
+    else:
+        bias = conf = edge = 0.0
+
+    net = 1 if bias > 0 else (-1 if bias < 0 else 0)
+    agreement = sum(
+        1 for v, _ in directional
+        if net != 0 and (1 if v.bias > 0 else -1) == net
+    )
+    result = ConsensusResult(
+        bias=bias,
+        confidence=conf,
+        edge=edge,
+        verdict=bias_to_verdict(bias),
+        agreement_count=agreement,
+        per_model=verdicts,
+        gate=decision.to_dict(),
+        directional_count=len(directional),
+        abstentions=abstentions,
+        errors=errors,
+        exhausted=exhausted,
+    )
+    # Per-provider persistence for replay (2026-07-20): every scored round is
+    # recorded with its full state, exact prompts, and one row per provider,
+    # when the caller passed a db path. Fail-safe: a persistence error never
+    # touches the verdict.
+    if state.get("db"):
+        from .persist import record_evaluation
+        record_evaluation(str(state["db"]), state, result, cfg_path=cfg_path)
+    return result
+
+
+def council_status_line(cfg_path: str | None = None) -> str:
+    """One-line, unambiguous statement of which council + gate are active.
+
+    Printed at bridge startup so it is never ambiguous whether the REAL council
+    or the MOCK council is running (see Task 5 startup requirement).
+    """
+    real = use_real_council(cfg_path)
+    names = llm_model_names(cfg_path)
+    if real:
+        council = (f"REAL council [{names.get('llm_primary', 'gpt-5.5')}, "
+                   f"{names.get('llm_secondary', 'claude-opus-4-8')}, "
+                   f"{names.get('llm_tertiary', 'gemini-3.1-pro-preview')}]")
+    else:
+        council = "MOCK council (deterministic offline stand-ins)"
+    if gate_enabled(cfg_path):
+        gate = f"base-check gate ON ({names.get('llm_gate', 'claude-haiku-4-5')})"
+    else:
+        # A CONDITION, NOT A SETTING (2026-07-25). Off means every candidate
+        # reaches all three providers unscreened, which is the amplification
+        # the gate exists to prevent, so the startup block states the
+        # consequence rather than a quiet "OFF" nobody reads twice.
+        gate = ("base-check gate DISABLED -> every candidate reaches the full "
+                "three-provider council unscreened")
+    line = f"LLM council: {council}; {gate}"
+    # A COUNCIL RUNNING ONE-HANDED MUST SAY SO (2026-07-27). When an account is
+    # out of quota the configured provider list stops describing what actually
+    # answers, so the exhaustion is appended here rather than left to be
+    # inferred from a log after the run.
+    dry = exhaustion_line()
+    return f"{line}; {dry}" if dry else line
+
+
+if __name__ == "__main__":
+    import json
+
+    s = {"symbol": "BTC-USD", "ret_5": 0.02, "imbalance": 0.3, "catalyst": 0.4}
+    print(council_status_line())
+    print(json.dumps(consensus(s).to_dict(), indent=2))
